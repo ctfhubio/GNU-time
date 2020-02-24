@@ -57,7 +57,8 @@ enum
 {
   EXIT_CANCELED = 125, /* Internal error prior to exec attempt.  */
   EXIT_CANNOT_INVOKE = 126, /* Program located, but not usable.  */
-  EXIT_ENOENT = 127 /* Could not find program to exec.  */
+  EXIT_ENOENT = 127, /* Could not find program to exec.  */
+  EXIT_TIMEOUT = 124 /* Program execution exceeded the time limit. */
 };
 
 /* If the inferior program exited abnormally (e.g. signalled)
@@ -190,6 +191,28 @@ static const char *outfile;
 /* Output stream, stderr by default.  */
 static FILE *outfp;
 
+/* Name of the stderr file. Use -e option to specify the file name. */
+static const char *stderrfile;
+
+/* STDERR stream, STDERR by default. */
+static FILE *stderrfp;
+
+/* Name of the stdout file. Use -u option to specify the file name. */
+static const char *stdoutfile;
+
+/* STDERR stream, STDOUT by default. */
+static FILE *stdoutfp;
+
+/* Name of the stdin file. Only used if -k option is given. */
+static const char *stdinfile;
+
+/* STDIN stream, STDIN by default. */
+static FILE *stdinfp;
+
+/* Timeout duration of child process. */
+static int timeout = 0;
+pid_t child_pid;
+
 /* If true, append to `outfile' rather than truncating it.  */
 static bool append;
 
@@ -208,6 +231,10 @@ static struct option longopts[] =
   {"portability", no_argument, NULL, 'p'},
   {"quiet", no_argument, NULL, 'q'},
   {"verbose", no_argument, NULL, 'v'},
+  {"stderrfile", no_argument, NULL, 'e'},
+  {"stdoutfile", no_argument, NULL, 'u'},
+  {"stdin", no_argument, NULL, 'k'},
+  {"timeout", no_argument, NULL, 't'},
   {"version", no_argument, NULL, 'V'},
   {NULL, no_argument, NULL, 0}
 };
@@ -266,6 +293,30 @@ Usage: %s [-apvV] [-f format] [-o file] [--append] [--verbose]\n\
                             the default format\n\
 "), stdout);
 
+  fputs (_("\
+  -v, --verbose             print all resource usage information instead of\n\
+                            the default format\n\
+"), stdout);
+
+  fputs (_("\
+  -e, --stderrfile          path to file where STDERR of the command would be written.\n\
+                            Default STDERR.\n\
+"), stdout);
+
+  fputs (_("\
+  -u, --stdoutfile          path to file where STDOUT of the command would be written.\n\
+                            Default STDOUT.\n\
+"), stdout);
+
+  fputs (_("\
+  -k, --stdinfile           (Optional) path to file from where STDIN would be passed to the command\n\
+"), stdout);
+
+  fputs (_("\
+  -t, --timeout             Timeout duration for the command. Default is None.\n\
+                            A value of 0 (zero) will not terminate the command.\n\
+                            Value should be greater than zero, and must be an integer.\n\
+"), stdout);
 
   fputs (_("\
   -h,  --help               display this help and exit\n"), stdout);
@@ -648,6 +699,16 @@ getargs (argc, argv)
   verbose = false;
   outfile = NULL;
   outfp = stderr;
+
+  stderrfile = NULL;
+  stderrfp = stderr;
+
+  stdoutfile = NULL;
+  stdoutfp = stdout;
+
+  stdinfile = NULL;
+  stdinfp = stdin;
+
   append = false;
   output_format = default_format;
 
@@ -657,7 +718,7 @@ getargs (argc, argv)
   if (format)
     output_format = format;
 
-  while ((optc = getopt_long (argc, argv, "+af:o:pqvV", longopts, (int *) 0))
+  while ((optc = getopt_long (argc, argv, "+af:e:u:k:t:o:pqvV", longopts, (int *) 0))
 	 != EOF)
     {
       switch (optc)
@@ -681,6 +742,18 @@ getargs (argc, argv)
       break;
 	case 'v':
 	  verbose = true;
+	  break;
+	case 'e':
+	  stderrfile = optarg;
+	  break;
+	case 'u':
+	  stdoutfile = optarg;
+	  break;
+	case 'k':
+	  stdinfile = optarg;
+	  break;
+	case 't':
+	  timeout = atoi(optarg);
 	  break;
 	case 'V':
       version_etc (stdout, PROGRAM_NAME, PACKAGE_NAME, Version, AUTHORS,
@@ -707,6 +780,25 @@ getargs (argc, argv)
 	error (EXIT_CANCELED, errno, "%s", outfile);
     }
 
+    if (stderrfile) {
+        stderrfp = fopen (stderrfile, "w");
+        if (stderrfp == NULL)
+            error (EXIT_CANCELED, errno, "%s", stderrfile);
+    }
+
+    if (stdoutfile) {
+        stdoutfp = fopen (stdoutfile, "w");
+        if (stdoutfp == NULL)
+            error (EXIT_CANCELED, errno, "%s", stdoutfile);
+    }
+
+    if (stdinfile)
+    {
+        stdinfp = fopen (stdinfile, "r");
+        if (stdinfp == NULL)
+            error (EXIT_CANCELED, errno, "%s", stdinfile);
+    }
+
   /* If the user specified verbose output, we need to convert
      `longstats' to a `char *'.  */
   if (verbose)
@@ -718,7 +810,18 @@ getargs (argc, argv)
 
   return (const char **) &argv[optind];
 }
-
+
+static void
+alarm_handler (int sig)
+{
+    int result = waitpid(child_pid, NULL, WNOHANG);
+    if (result == 0) {
+        // Child still running, so kill it.
+        kill(child_pid, SIGINT);
+        exit(EXIT_TIMEOUT);
+    }
+}
+
 /* Run command CMD and return statistics on it.
    Put the statistics in *RESP.  */
 
@@ -734,12 +837,22 @@ run_command (cmd, resp)
   resuse_start (resp);
 
   pid = fork ();		/* Run CMD as child process.  */
+  child_pid = pid;
   if (pid < 0)
     error (EXIT_CANCELED, errno, "cannot fork");
   else if (pid == 0)
     {				/* If child.  */
       /* Don't cast execvp arguments; that causes errors on some systems,
 	 versus merely warnings if the cast is left off.  */
+      if (stdinfile)
+        dup2(fileno(stdinfp), STDIN_FILENO);
+      dup2(fileno(stdoutfp), STDOUT_FILENO);
+      dup2(fileno(stderrfp), STDERR_FILENO);
+      if (stdinfile)
+        fclose(stdinfp);
+      fclose(stdoutfp);
+      fclose(stderrfp);
+
       execvp (cmd[0], cmd);
       saved_errno = errno;
       error (0, errno, "cannot run %s", cmd[0]);
@@ -749,6 +862,9 @@ run_command (cmd, resp)
   /* Have signals kill the child but not self (if possible).  */
   interrupt_signal = signal (SIGINT, SIG_IGN);
   quit_signal = signal (SIGQUIT, SIG_IGN);
+
+  signal (SIGALRM, alarm_handler);
+  alarm(timeout);
 
   if (resuse_end (pid, resp) == 0)
     error (1, errno, "error waiting for child process");
