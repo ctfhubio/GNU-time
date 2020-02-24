@@ -631,8 +631,8 @@ summarize (fp, fmt, command, resp)
 	    case 'w':		/* Voluntary context switches.  */
 	      fprintf (fp, "%ld", resp->ru.ru_nvcsw);
 	      break;
-	    case 'x':		/* Exit status.  */
-	      fprintf (fp, "%d", WEXITSTATUS (resp->waitstatus));
+	    case 'x':
+	      fprintf (fp, "%d", resp->waitstatus);
 	      break;
 	    case '\0':
 	      putc ('?', fp);
@@ -902,5 +902,5 @@ main (argc, argv)
       status = EXIT_FAILURE;
     }
 
-  return status;
+  return 0;
 }
